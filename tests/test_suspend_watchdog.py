@@ -86,7 +86,9 @@ class _Jumping:
     def __getattr__(self, n):
         return getattr(time, n)
 
-err, reason, dt = blocked_send(stall_after=999, fake_time=_Jumping())
+# The clock jumps after 0.5 s, long before a 5 s stall would fire; 5 s also
+# bounds the wait on macOS, where only the send timeout wakes the send.
+err, reason, dt = blocked_send(stall_after=5, fake_time=_Jumping())
 check("suspend aborts the send", err is not None, repr(err))
 check("reason says sleep", reason and "sleep" in reason, reason)
 
