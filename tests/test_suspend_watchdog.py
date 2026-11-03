@@ -30,8 +30,16 @@ def check(name, ok, detail=""):
 
 
 def blocked_send(stall_after=1.0, fake_time=None):
-    """Fill a socketpair nobody reads; return (error, reason, seconds)."""
-    a, b = socket.socketpair()
+    """Fill a TCP connection nobody reads; return (error, reason, seconds).
+
+    TCP like the real upload: on macOS socketpair() is AF_UNIX, where
+    shutdown() does not reliably wake a blocked send()."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    a = socket.create_connection(srv.getsockname())
+    b, _ = srv.accept()
+    srv.close()
     a.settimeout(600)                       # like the real PUT connection
 
     def abort():                            # same as the app's _abort_conn
