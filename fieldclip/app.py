@@ -268,6 +268,12 @@ class SuspendWatchdog:
         self._stop.set()
         return False
 
+    @property
+    def send_timeout(self) -> float:
+        """Socket timeout for the sending phase: a little past `stall_after`,
+        so the watchdog has fired (and set `reason`) by the time it expires."""
+        return self._stall_after * 1.5 + self._poll
+
     def progress(self):
         self._last = time.monotonic()
 
@@ -4006,8 +4012,10 @@ class App(tk.Tk):
                             # The watchdog shuts the socket down if the machine sleeps or the
                             # stream stalls, so the blocked send()/getresponse() raises and the
                             # retry loop below starts a clean upload instead of hanging forever.
-                            # shutdown() wakes the blocked call on Linux and macOS; on
-                            # Windows it sometimes does not, close() does.
+                            # shutdown() wakes the blocked call on Linux; on Windows it
+                            # sometimes does not, close() does. On macOS neither wakes a
+                            # blocked send(), so the body is also sent with a socket
+                            # timeout just past `stall_after`: a stall ends there on every OS.
                             def _abort_conn(c=conn):
                                 for stop in (lambda s: s.shutdown(socket.SHUT_RDWR),
                                              lambda s: s.close()):
@@ -4018,6 +4026,7 @@ class App(tk.Tk):
                                 with SuspendWatchdog(_abort_conn) as wd:
                                     try:
                                         conn.connect()
+                                        conn.sock.settimeout(wd.send_timeout)
                                         conn.putrequest("PUT", path)
                                         for hk, hv in headers.items():
                                             conn.putheader(hk, hv)
@@ -4058,6 +4067,7 @@ class App(tk.Tk):
                                         # ERDA checksums the file before answering: silence is
                                         # normal here, so only a suspend may abort the wait.
                                         wd.armed = False
+                                        conn.sock.settimeout(WEBDAV_RESPONSE_TIMEOUT)
                                         response = conn.getresponse()
                                         resp_status = response.status
                                     except Exception as e:

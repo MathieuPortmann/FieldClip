@@ -32,8 +32,9 @@ def check(name, ok, detail=""):
 def blocked_send(stall_after=1.0, fake_time=None):
     """Fill a TCP connection nobody reads; return (error, reason, seconds).
 
-    TCP like the real upload: on macOS socketpair() is AF_UNIX, where
-    shutdown() does not reliably wake a blocked send()."""
+    TCP and timeouts like the real upload: 600 s for the connection, then
+    `send_timeout` while the body is sent (on macOS nothing else wakes a
+    blocked send())."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
@@ -54,6 +55,7 @@ def blocked_send(stall_after=1.0, fake_time=None):
     err, t0 = None, time.monotonic()
     try:
         with RV.SuspendWatchdog(abort, stall_after=stall_after, poll=0.2) as wd:
+            a.settimeout(wd.send_timeout)
             try:
                 while True:
                     a.send(b"x" * 65536)
