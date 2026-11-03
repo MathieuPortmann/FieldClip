@@ -1,0 +1,12 @@
+{
+  "_comment": "Fictional vocabulary used by the test suite.",
+  "profile_name": "Test suite",
+  "fields": {
+    "site":  {"label": "Site",  "values": ["North-Meadow", "Lake-Shore", "Lake",
+                                           {"name": "Old-Forest", "aliases": ["Old_Forrest"]}]},
+    "group": {"label": "Group", "values": ["Herd-A", "Herd-B", "Mixed"]}
+  },
+  "devices": {"legacy_aliases": {"DJI_Mini_4_Pro": "Mini4Pro", "DJI_Mini_4": null,
+                                 "DJI_Mini_3_Pro": "Mini3Pro", "DJI_Mini_3": null}},
+  "layout": {"path": "{category}/{site}", "main_dir": "Main", "training_dir": "Training"}
+}

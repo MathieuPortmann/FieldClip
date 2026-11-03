@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.8", "3.12"]
+        exclude:
+          - os: macos-latest      # no Python 3.8 build for Apple-silicon runners
+            python: "3.8"
+          - os: ubuntu-latest     # no Python 3.8 build for the newest Ubuntu
+            python: "3.8"
+        include:
+          - os: ubuntu-22.04
+            python: "3.8"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install ffmpeg and a virtual display (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg xvfb
+      - name: Validate the shipped profiles
+        run: |
+          python -m fieldclip --validate-profile example
+          python -m fieldclip --validate-profile erda
+      - name: Offline tests (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python tests/run_all.py --offline
+      - name: Offline tests
+        if: runner.os != 'Linux'
+        run: python tests/run_all.py --offline

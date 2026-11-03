@@ -1,0 +1,23 @@
+{
+  "_comment": "Example profile. Copy it to myproject.local.json (ignored by git) and edit. See docs/configuration.md.",
+  "profile_name": "Example wildlife survey",
+
+  "fields": {
+    "site":  {"label": "Site",
+              "values": ["North-Meadow", "South-Meadow", "Lake-Shore",
+                         {"name": "Old-Forest", "aliases": ["Old_Forrest"]}]},
+    "group": {"label": "Group",
+              "values": ["Herd-A", "Herd-B", "Mixed"]}
+  },
+
+  "naming": {
+    "template":          "{device}_{date}_{time}_{group}_{site}",
+    "training_template": "{device}_{date}_{time}_{site?}_Training"
+  },
+
+  "training": {"label": "Training", "auto_max_duration_s": 300},
+
+  "layout": {"path": "{category}/{site}", "main_dir": "Survey", "training_dir": "Training"},
+
+  "encoding": {"faststart": true, "reencode": {"when": "broken_h264_10bit"}}
+}

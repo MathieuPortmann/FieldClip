@@ -1,0 +1,22 @@
+{
+  "_comment": "Server preset for ERDA (Aarhus University, https://erda.au.dk). Public host and ports only: your Share ID is entered in the app, never here. Use it from your own profile with \"extends\": \"erda\".",
+  "profile_name": "ERDA",
+  "remote": {
+    "display_name": "ERDA",
+    "auth": "sharelink",
+    "secret_label": "Share ID",
+    "webdav": {
+      "url": "https://io.erda.au.dk:4443/",
+      "subdir": "",
+      "ca_bundle": "profiles/certs/GEANT_TLS_RSA_1.pem",
+      "response_timeout_s": 600
+    },
+    "mount": {
+      "host": "io.erda.au.dk",
+      "sftp_port": 2222,
+      "windows_drive": "W",
+      "unix_mountpoint": "~/erda_mount",
+      "volume_label": "ERDA"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+# Secrets and per-machine state - never commit
+erda_config.json
+*apikey*
+*api_key*
+*.secret*
+.env
+.config.json
+profiles/*.local.json
+
+# Logs and runtime files
+logs/
+*.log
+.fieldclip_device.json
+
+# Bundled third-party binaries (download separately, see README)
+bin/
+ffmpeg/
+djilog/
+/certs/
+*.exe
+
+# Python / OS noise
+__pycache__/
+*.pyc
+.pytest_cache/
+._*
+.DS_Store
+Thumbs.db
+*.docx
+backups/
+
+# Shared secret files of one installation (remote.secret_file, tools.dji_api_key_file)
+shared/
