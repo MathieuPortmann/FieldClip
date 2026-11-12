@@ -3427,7 +3427,7 @@ class App(tk.Tk):
             for w in _warn: self._q_log(f"     - {w}", C["muted"])
             if not HFL.find_logs(folder):
                 self._q_log("     -  No DJI flight record (DJIFlightRecord_*.txt) here or one "
-                            "level down - no SRT rebuild, no telemetry sidecar.", C["warning"])
+                            "level down or up - no SRT rebuild, no telemetry sidecar.", C["warning"])
                 devs = sorted({v.get('device', '?') for v in vids})
                 self._q_log(f"        Drone model stays {', '.join(devs)} - taken from the "
                             "folder/file name, not from a log.", C["muted"])

@@ -105,11 +105,20 @@ LOG_RE    = re.compile(r'(?:DJI)?FlightRecord_(\d{4}-\d{2}-\d{2})_\[(\d{2}-\d{2}
 
 def find_logs(folder) -> list:
     """Records beside the clips, and one level down: the DJI apps drop them in a
-    subfolder (FlightRecord/, DJIFlightRecord/) about as often as in the root."""
+    subfolder (FlightRecord/, DJIFlightRecord/) about as often as in the root.
+    When neither has any, the folder one level up: a card copied as-is keeps the
+    clips in DCIM/100MEDIA/ while the records are exported beside that folder.
+    Only the parent itself is searched, not its other subfolders, so another
+    session stored next to this one is not decoded for nothing."""
     out = []
     for g in LOG_GLOBS:
         out += glob.glob(os.path.join(folder, g))
         out += glob.glob(os.path.join(folder, "*", g))
+    if not out:
+        parent = os.path.dirname(os.path.abspath(folder))
+        if parent and parent != os.path.abspath(folder):
+            for g in LOG_GLOBS:
+                out += glob.glob(os.path.join(parent, g))
     return sorted({p for p in out if p.lower().endswith(".txt")})
 
 # CANONICAL sidecar schema - keep this order stable across every producer.
@@ -211,7 +220,12 @@ def model_token(meta) -> str:
     for r in rules:
         if r.get("aircraft") and r["aircraft"].lower() in an:
             return r["token"]
-    dt = str(meta.get("droneType") or "")
+    dt = str(meta.get("droneType") or "").strip()
+    # dji-log writes a type it has no name for as Unknown(87) (or similar): keep
+    # the number, which is what the profile's drone_type rules are written in.
+    m = re.fullmatch(r'unknown\W*(\d+)\W*', dt, re.I)
+    if m:
+        dt = m.group(1)
     for r in rules:
         if r.get("drone_type") is not None and str(r["drone_type"]) == dt:
             return r["token"]

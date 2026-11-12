@@ -20,7 +20,8 @@ works on Windows, macOS (Intel and Apple silicon) and Linux.
 
 1. **Keep each flight session's files together** in one folder: the `.MP4`
    and `.SRT` files, and the `DJIFlightRecord_*.txt` logs exported from the DJI
-   app on the remote controller. The logs may also be one folder down.
+   app on the remote controller. The logs may also be one folder down, or one folder up
+   (e.g. clips in `100MEDIA/`, logs beside it).
    - Video + flight log are **required** for this step. If a log is missing,
      you get an error message.
    - A missing SRT is **rebuilt from the log**. That is not an error.
