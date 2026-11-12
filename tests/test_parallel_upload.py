@@ -199,7 +199,8 @@ def make_files(n, size):
 def entries(paths):
     return [{'path': p, 'filename': os.path.basename(p), 'status': 'ok',
              'site': 'North-Meadow', 'group': 'Herd-A',
-             'is_training': False, 'corrupt': False} for p in paths]
+             'is_training': False, 'corrupt': False,
+             'new_path': p, 'dest_folder': os.path.dirname(p)} for p in paths]
 
 
 def make_app(parallel):
@@ -344,6 +345,12 @@ check("5. no partial copy left on the server", not partial,
 check("5. some uploads had really started", sum(DAV.put_count.values()) >= 2,
       str(DAV.put_count))
 check("5. log explains the cancel", "Cancelled" in log_text(app))
+not_sent = [r for r in app.renamed if not r.get('new_path')]
+check("5. files not uploaded have no destination recorded", len(not_sent) >= 2,
+      f"{len(not_sent)} without new_path")
+check("5. step 6 cannot verify a file against itself",
+      RV.verify_transfer(big[0], big[0])[0] is False,
+      RV.verify_transfer(big[0], big[0])[1])
 app.destroy()
 
 # 6. Second run skips what is already there -------------------------------------

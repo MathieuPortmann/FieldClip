@@ -1768,6 +1768,14 @@ def verify_transfer(src: str, dst: str) -> tuple:
 
     if not os.path.exists(dst):
         return False, "missing at destination"
+    # Steps 3 and "already renamed" record the source itself as new_path until
+    # a transfer replaces it. A file whose transfer was cancelled or never ran
+    # would otherwise "verify" against itself and unlock deleting the original.
+    try:
+        if os.path.samefile(src, dst):
+            return False, "not transferred (destination is the source file)"
+    except OSError:
+        pass
     try:
         dst_size = os.path.getsize(dst)
         if dst_size != src_size:
@@ -4087,6 +4095,10 @@ class App(tk.Tk):
                 self._q_log(f"✗  Cannot read source file: {r.get('path')}", C["danger"])
                 r['status'] = 'error'; r['error'] = 'source unreadable'
                 continue
+            # Until this upload succeeds, nothing is on the server for it. The
+            # local path recorded by step 3 must not survive a cancel or a
+            # failure as if it were the destination (see verify_transfer).
+            r.pop('new_path', None); r.pop('dest_folder', None)
             todo.append((r, size))
 
         n_files = len(todo)
