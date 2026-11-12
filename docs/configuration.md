@@ -112,6 +112,11 @@ could match, the longest one wins (`Lake-Shore` before `Lake`).
   intermediate certificate.
 - `webdav.response_timeout_s`: how long to wait for the server's answer after
   an upload. Some servers checksum the whole file first.
+- `webdav.parallel_uploads`: how many files are uploaded at the same time, 1 to
+  4 (default 3). Over a long or lossy route a single connection rarely uses the
+  whole line; two or three together usually do. This is only the starting
+  value: the user can change it in the destination card, and FieldClip
+  remembers their choice.
 - `mount.host`, `mount.sftp_port`: SSH server for SSHFS. The user name is the
   credential (`sharelink`) or `username`.
 - `mount.windows_drive`, `mount.unix_mountpoint`, `mount.volume_label`: where
@@ -274,7 +279,8 @@ be the same folder. Switching transport keeps the same destination.
       "url": "",
       "subdir": "",
       "ca_bundle": "",
-      "response_timeout_s": 600
+      "response_timeout_s": 600,
+      "parallel_uploads": 3
     },
     "mount": {
       "host": "",

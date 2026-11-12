@@ -160,6 +160,10 @@ DEFAULTS = {
             "subdir":  "",          # default folder inside the share
             "ca_bundle": "",        # extra PEM file, relative to the root or absolute
             "response_timeout_s": 600,
+            # Files uploaded at the same time (1-4). On a long or lossy route
+            # one connection rarely fills the line; several do. The user can
+            # change it in the destination card; this is the first-run value.
+            "parallel_uploads": 3,
         },
         "mount": {
             "host":            "",

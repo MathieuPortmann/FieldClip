@@ -113,6 +113,25 @@ LEGACY_DEVICE_TOKENS = dict(SETTINGS["devices"]["legacy_aliases"])
 SECRET_LABEL = SETTINGS["remote"].get("secret_label", "Password")
 REENCODE_WHEN = SETTINGS["encoding"]["reencode"]["when"]
 WEBDAV_RESPONSE_TIMEOUT = SETTINGS["remote"]["webdav"].get("response_timeout_s", 600)
+WEBDAV_MAX_RETRIES  = 5      # attempts per file before giving up on it
+WEBDAV_RETRY_DELAY  = 15     # seconds between two attempts
+
+# Files uploaded at the same time over WebDAV. The profile gives the first-run
+# value; the user's choice in the destination card is remembered after that.
+PARALLEL_UPLOADS_MAX = 4
+
+
+def _clamp_parallel(value) -> int:
+    """A usable number of simultaneous uploads (1..PARALLEL_UPLOADS_MAX)."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = 1
+    return max(1, min(PARALLEL_UPLOADS_MAX, n))
+
+
+DEFAULT_PARALLEL_UPLOADS = _clamp_parallel(
+    SETTINGS["remote"]["webdav"].get("parallel_uploads", 3))
 
 
 def _template_wants(field: str, is_training: bool) -> bool:
@@ -355,6 +374,104 @@ def _network_keepalive_thread(dest_root: str, stop_event: threading.Event):
                 probe_path(dest_root, timeout=8)
         except Exception:
             pass  # Keepalive errors are non-fatal
+
+
+class _UploadCancelled(Exception):
+    """Cancel was pressed while a file was being sent."""
+
+
+def _fmt_bytes(n: float) -> str:
+    """1536 MB -> '1.5 GB'; below a gigabyte, whole megabytes."""
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.1f} GB"
+    return f"{n / 1024 ** 2:.0f} MB"
+
+
+class _UploadJob:
+    """One file of a WebDAV upload. Its mutable fields are only changed
+    through _UploadTracker, under the tracker's lock."""
+
+    def __init__(self, r: dict, size: int, tag: str):
+        self.r, self.size, self.tag = r, size, tag
+        self.name     = r['filename']
+        # queued -> checking -> sending -> server -> companions -> finished,
+        # with 'retry' between attempts.
+        self.phase    = 'queued'
+        self.sent     = 0          # bytes of the current attempt
+        self.t_send   = 0.0        # monotonic start of the current attempt
+        self.attempt  = 0
+        self.retry_at = 0.0
+        self.outcome  = None       # 'ok' | 'error' | 'cancelled'
+
+
+class _UploadTracker:
+    """Progress shared by the upload threads and read by the coordinator."""
+
+    SPEED_WINDOW = 20.0            # seconds the displayed speed averages over
+
+    def __init__(self, jobs: list):
+        self.lock        = threading.Lock()
+        self.jobs        = jobs
+        self.total_bytes = sum(j.size for j in jobs)
+        self._wire       = 0       # bytes actually sent, failed attempts included
+        self._samples    = [(time.monotonic(), 0)]
+
+    def start(self, job):
+        self.set_phase(job, 'checking')
+
+    def set_phase(self, job, phase: str, attempt=None, retry_at=None):
+        with self.lock:
+            job.phase = phase
+            if attempt is not None:
+                job.attempt = attempt
+            if retry_at is not None:
+                job.retry_at = retry_at
+            if phase == 'sending':
+                job.sent, job.t_send = 0, time.monotonic()
+
+    def add_sent(self, job, n: int):
+        with self.lock:
+            job.sent   += n
+            self._wire += n
+
+    def finish(self, job, outcome: str):
+        with self.lock:
+            job.phase, job.outcome = 'finished', outcome
+
+    def all_finished(self) -> bool:
+        """True when every file ended uploaded or failed (none cancelled or
+        never started)."""
+        with self.lock:
+            return all(j.phase == 'finished' and j.outcome in ('ok', 'error')
+                       for j in self.jobs)
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            now = time.monotonic()
+            n_done, accounted, active = 0, 0, []
+            for j in self.jobs:
+                if j.phase == 'finished':
+                    if j.outcome in ('ok', 'error'):
+                        n_done    += 1
+                        accounted += j.size
+                elif j.phase != 'queued':
+                    if j.phase in ('sending', 'server'):
+                        accounted += j.sent
+                    elif j.phase == 'companions':
+                        accounted += j.size
+                    active.append({'tag': j.tag, 'name': j.name, 'phase': j.phase,
+                                   'sent': j.sent, 'size': j.size,
+                                   't_send': j.t_send, 'attempt': j.attempt,
+                                   'retry_at': j.retry_at})
+            self._samples.append((now, self._wire))
+            while len(self._samples) > 2 and now - self._samples[1][0] >= self.SPEED_WINDOW:
+                self._samples.pop(0)
+            t0, w0 = self._samples[0]
+            speed = (self._wire - w0) / (now - t0) if now - t0 >= 1.0 else 0.0
+            return {'n_files': len(self.jobs), 'n_done': n_done,
+                    'total_bytes': self.total_bytes,
+                    'accounted': min(accounted, self.total_bytes),
+                    'active': active, 'speed': speed}
 
 
 # =============================================================================
@@ -1923,6 +2040,13 @@ class App(tk.Tk):
         self._worker_dead_at    = None    # for the stuck-worker watchdog
         self._cancel_flag = threading.Event()
         self._retry_event = threading.Event()   # created once, not per attempt
+        # Bumped by "Force retry now". Parallel uploads compare it with the
+        # value they saw when they started waiting (see _upload_one_webdav).
+        self._retry_gen   = 0
+        self._retry_popup = None                # at most one such popup at a time
+        # How many files go up at the same time over WebDAV (1..4).
+        self.parallel_uploads = tk.IntVar(value=_clamp_parallel(
+            self.cfg.get("parallel_uploads", DEFAULT_PARALLEL_UPLOADS)))
         # Values copied off the Tk variables just before a worker starts.
         # Workers must never call .get() on a tkinter variable themselves.
         self._snap        = {}
@@ -1973,6 +2097,12 @@ class App(tk.Tk):
                     foreground=C["text"], selectbackground=C["accent"], arrowcolor=C["accent_lite"])
         s.map('TCombobox', fieldbackground=[('readonly',C["entry_bg"])],
               foreground=[('readonly',C["text"])])
+        # Same look as the combobox; read-only must not look disabled.
+        s.configure('TSpinbox',        fieldbackground=C["entry_bg"], background=C["panel2"],
+                    foreground=C["text"], arrowcolor=C["accent_lite"])
+        s.map('TSpinbox', fieldbackground=[('readonly',C["entry_bg"]),
+                                           ('disabled',C["panel2"])],
+              foreground=[('disabled',C["muted"]), ('readonly',C["text"])])
         s.configure('TEntry',          fieldbackground=C["entry_bg"], foreground=C["text"],
                     insertcolor=C["text"], borderwidth=0, relief='flat')
         s.configure('Treeview',        background=C["panel2"], foreground=C["text"],
@@ -2163,6 +2293,25 @@ class App(tk.Tk):
                             command=self._on_transport_change).pack(side='left')
             self._label(row, f"  — {desc}", fg=C["muted"], bg=C["panel2"],
                         font=('Helvetica',9)).pack(side='left')
+            if val == "webdav":
+                self._webdav_tr_row = row
+
+        # How many files are uploaded at once. Shown under the HTTPS choice
+        # only, since the folder copy is one file at a time by design.
+        self._par_row = tk.Frame(self._dest_card, bg=C["panel2"])
+        self._label(self._par_row, "Files uploaded at the same time:",
+                    fg=C["text"], bg=C["panel2"],
+                    font=('Helvetica',10)).pack(side='left', padx=(24,6))
+        self._par_spin = ttk.Spinbox(self._par_row, from_=1, to=PARALLEL_UPLOADS_MAX,
+                                     increment=1, width=3, wrap=False,
+                                     textvariable=self.parallel_uploads,
+                                     state='readonly')
+        self._par_spin.pack(side='left')
+        self._label(self._par_row,
+                    "  — several at once use more of your connection; "
+                    "1 = one after the other",
+                    fg=C["muted"], bg=C["panel2"],
+                    font=('Helvetica',9)).pack(side='left')
 
         # ── Credential + mount status ─────────────────────────────────────
         sid_row = tk.Frame(self._dest_card, bg=C["panel2"]); sid_row.pack(fill='x', pady=(8,0))
@@ -2364,7 +2513,27 @@ class App(tk.Tk):
                 self.cfg["last_webdav_url"] = cur
                 translated = self._url_to_path(cur)
                 self.dest_dir.set(translated or self.cfg.get("last_mount_dir", ""))
+        self._show_parallel_row()
         self._refresh_mount_badge()
+
+    def _show_parallel_row(self):
+        """The 'Files uploaded at the same time' row belongs to HTTPS upload."""
+        if not hasattr(self, "_par_row"):
+            return
+        try:
+            if self.transport.get() == "webdav":
+                self._par_row.pack(fill='x', pady=(2,0), after=self._webdav_tr_row)
+            else:
+                self._par_row.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _get_parallel(self) -> int:
+        """The chosen number of simultaneous uploads, always 1..4."""
+        try:
+            return _clamp_parallel(self.parallel_uploads.get())
+        except (tk.TclError, ValueError):
+            return DEFAULT_PARALLEL_UPLOADS
 
     def _refresh_mount_badge(self):
         """Probe the mount off the UI thread and colour the badge accordingly."""
@@ -2446,6 +2615,10 @@ class App(tk.Tk):
             for sub in w.winfo_children():
                 try: sub.config(state=state)
                 except: pass
+        # 'normal' would make the spinbox accept typed text; arrows only.
+        if hasattr(self, "_par_spin"):
+            try: self._par_spin.config(state='readonly' if mode == 'copy' else 'disabled')
+            except tk.TclError: pass
 
     def _step_source_next(self):
         # Read folders from listbox
@@ -2523,6 +2696,7 @@ class App(tk.Tk):
         self.cfg["do_faststart"]     = self.do_faststart.get()
         self.cfg["do_reencode_hevc"] = self.do_reencode_hevc.get()
         self.cfg["transport"]        = self.transport.get()
+        self.cfg["parallel_uploads"] = self._get_parallel()
         S.set_secret("remote_secret", self.share_id.get())
         set_webdav_credentials(self.share_id.get())
         # Always save dest_dir, including WebDAV URLs
@@ -3558,8 +3732,15 @@ class App(tk.Tk):
                     "Check the network connection or the mounted drive.")
                 return
 
-        self.btn_next.config(state='disabled', text="Copying…")
-        self._label(self.content, "Step 4 — Copying files",
+        n_par = self._get_parallel() if is_webdav else 1
+        if is_webdav:
+            title = ("Step 4 — Uploading files"
+                     + (f"  ({n_par} at a time)" if n_par > 1 else ""))
+        else:
+            title = "Step 4 — Copying files"
+        self.btn_next.config(state='disabled',
+                             text="Uploading…" if is_webdav else "Copying…")
+        self._label(self.content, title,
                     fg=C["accent_lite"], font=('Helvetica',17,'bold')).pack(anchor='w', pady=(0,6))
 
         self._log = scrolledtext.ScrolledText(self.content, bg=C["entry_bg"],
@@ -3584,15 +3765,17 @@ class App(tk.Tk):
         self._eta_lbl = tk.Label(self.content, text="", bg=C["bg"],
                                   fg=C["muted"], font=('Helvetica',9))
         self._eta_lbl.pack(anchor='w', pady=(2,0))
+        # One line per file being sent (several when uploading in parallel).
         self._file_lbl = tk.Label(self.content, text="", bg=C["bg"],
-                                   fg=C["muted"], font=('Helvetica',9))
+                                   fg=C["muted"], font=('Helvetica',9),
+                                   justify='left', anchor='w')
         self._file_lbl.pack(anchor='w')
 
         self._cancel_flag.clear()
         self._queue = queue.Queue()
         # See the note in _show_step_rename: Tk variables must be read on the
         # main thread, not from inside the worker.
-        self._snap = {'dest_root': dest}
+        self._snap = {'dest_root': dest, 'parallel': n_par}
         if is_webdav:
             self._proc_thread = self._start_worker(self._worker_copy_webdav, "upload")
         else:
@@ -3869,21 +4052,56 @@ class App(tk.Tk):
             _ka_stop.set()
             restore_fn()
 
+    # ── WebDAV upload (step 4) ───────────────────────────────────────────────
+    #
+    # Several files go up at the same time (the "Files uploaded at the same
+    # time" choice, default remote.webdav.parallel_uploads). Measured from a
+    # home line to ERDA: one long-lived connection settled at ~16 Mbit/s while
+    # the same line carried ~105 Mbit/s spread over four connections. Each file
+    # keeps its own connection, retries, stall watchdog and log lines; the
+    # coordinator below only hands out files and reports progress.
+
     def _worker_copy_webdav(self):
         """
-        Step 4 (WebDAV mode): Upload already-renamed files to a WebDAV server
-        using HTTP PUT, with folder creation (MKCOL), skip-if-same-size, resume,
-        and automatic retry.
+        Step 4 (WebDAV mode): upload the renamed files with HTTP PUT, N at a
+        time, with folder creation (MKCOL), skip-if-same-size and automatic
+        retry. Posts exactly one terminal message: 'done' or 'cancelled'.
         """
-        dest_root  = self._snap['dest_root'].rstrip("/") + "/"
-        total      = len(self.renamed)
-        t_start    = time.time()
-        chunk_size = 4 * 1024 * 1024  # 4 MB chunks
-        mb_done_total = 0.0     # running total; see the note further down
+        dest_root = self._snap['dest_root'].rstrip("/") + "/"
+        n_par     = _clamp_parallel(self._snap.get('parallel', 1))
 
-        # Prevent the machine from sleeping during transfer (all OSes)
+        # Files to send, in order. Sizes are read up front so progress and
+        # ETA can be counted in bytes across files of very different sizes.
+        todo = []
+        for r in self.renamed:
+            if r.get('status') != 'ok':
+                continue
+            if r.get('corrupt'):
+                self._q_log(
+                    f"✗  Skipped {r.get('filename', '?')} — incomplete/corrupt "
+                    "file (no moov atom). Recover it before uploading.", C["danger"])
+                continue
+            try:
+                size = os.path.getsize(r['path'])
+            except Exception:
+                self._q_log(f"✗  Cannot read source file: {r.get('path')}", C["danger"])
+                r['status'] = 'error'; r['error'] = 'source unreadable'
+                continue
+            todo.append((r, size))
+
+        n_files = len(todo)
+        width   = len(str(n_files))
+        jobs    = [_UploadJob(r, size, f"[{k + 1:>{width}}/{n_files}]")
+                   for k, (r, size) in enumerate(todo)]
+        tracker = _UploadTracker(jobs)
+        n_par   = max(1, min(n_par, n_files))
+        if n_files:
+            self._q_log(
+                f"Uploading {n_files} file(s), "
+                + (f"{n_par} at a time." if n_par > 1 else "one at a time."),
+                C["muted"])
+
         restore_fn = keep_awake("FieldClip upload in progress")
-        # Start keepalive thread
         _ka_stop   = threading.Event()
         _ka_thread = threading.Thread(
             target=_network_keepalive_thread,
@@ -3891,298 +4109,48 @@ class App(tk.Tk):
         _ka_thread.start()
 
         try:
-            for i, r in enumerate(self.renamed):
-                if r.get('status') != 'ok':
-                    continue
-                if r.get('corrupt'):
-                    self._q_log(f"\n[{i+1}/{total}]  {r.get('filename','?')}", C["text"])
-                    self._q_log(
-                        "         ✗  Skipped — incomplete/corrupt file (no moov atom). "
-                        "Recover it before uploading.", C["danger"])
-                    continue
-                if self._cancel_flag.is_set():
-                    self._q_log(f"\n⚠  Cancelled after {i}/{total}.", C["warning"])
-                    self._queue.put(('cancelled', None))
-                    return
+            job_q = queue.Queue()
+            for j in jobs:
+                job_q.put(j)
+            mkcol_lock = threading.Lock()
 
-                src  = r['path']
-                name = r['filename']
-                is_tr  = NAMING.is_training_name(name) or bool(r.get('is_training'))
-                parts  = NAMING.dest_parts(is_tr, r)
-
-                # Build remote URL: dest_root / <layout folders> / filename
-                # Ensure intermediate collections exist
-                try:
-                    col_url = _webdav_ensure_collection(
-                        dest_root.rstrip("/"), parts, timeout=15)
-                except Exception as e:
-                    self._q_log(f"         ⚠  MKCOL failed: {e}", C["warning"])
-                    col_url = dest_root + "".join(
-                        urllib.parse.quote(p, safe="") + "/" for p in parts)
-
-                file_url = col_url + urllib.parse.quote(name, safe="")
-
-                self._q_log(f"\n[{i+1}/{total}]  {name}", C["text"])
-                self._q_log(f"         → {col_url}", C["muted"])
-                self._queue.put(('file_info', f"[{i+1}/{total}]  {name}"))
-
-                try:
-                    src_size = os.path.getsize(src)
-                except Exception:
-                    self._q_log(f"         ✗  Cannot read source file: {src}", C["danger"])
-                    r['status'] = 'error'; r['error'] = 'source unreadable'
-                    continue
-
-                base_pct    = i / total
-                max_retries = 5
-                retry_delay = 15
-                upload_ok   = False
-
-                for attempt in range(max_retries):
-                    if self._cancel_flag.is_set():
-                        self._queue.put(('cancelled', None))
-                        return
-
-                    # Check if remote file already exists and its size
-                    remote_size = _webdav_file_remote_size(file_url, timeout=10)
-
-                    if remote_size == src_size:
-                        # Size-only match. Same name and same length is almost
-                        # always the same file, but not necessarily - step 6
-                        # re-checks with a head/tail hash, which is what catches
-                        # a re-recorded clip that happens to match in length.
-                        self._q_log(
-                            "         ⏭  Already on server (same size) — skipped "
-                            "(content confirmed at step 6)", C["muted"])
-                        upload_ok = True
-                        r['new_path']    = file_url
-                        r['dest_folder'] = col_url
-                        break
-
-                    # Many WebDAV servers (ERDA among them) do not honour
-                    # Content-Range resume: a partial
-                    # remote file can never be appended to (every resume attempt
-                    # is dropped). Remove the incomplete file and re-upload the
-                    # whole thing from byte 0 instead.
-                    if 0 < remote_size < src_size:
-                        self._q_log(
-                            f"         🗑  Removing incomplete remote file "
-                            f"({remote_size/(1024*1024):.1f} MB) and re-uploading…",
-                            C["muted"])
-                        ok_del, del_msg = _webdav_delete(file_url, timeout=30)
-                        if not ok_del:
-                            self._q_log(
-                                f"         ⚠  Could not delete partial file ({del_msg}); "
-                                "PUT will attempt to overwrite it", C["warning"])
-                    resume_from = 0
-
-                    file_t_start = time.time()
-
+            def _runner():
+                while not self._cancel_flag.is_set():
                     try:
-                        with open(src, 'rb') as fi:
-                            bytes_to_send = src_size
-
-                            # Build a streaming iterator for the request body
-                            # urllib.request does not support streaming PUT natively,
-                            # so we use http.client directly.
-                            parsed = urllib.parse.urlparse(file_url)
-                            host   = parsed.netloc
-                            path   = parsed.path
-                            is_ssl = parsed.scheme == "https"
-
-                            # Response timeout of 600 s, not 60. ERDA checksums a
-                            # multi-GB upload after the last byte arrives, which
-                            # took far longer than a minute: getresponse() timed
-                            # out on files that had in fact been stored fine.
-                            if is_ssl:
-                                conn = http.client.HTTPSConnection(
-                                    host, context=_ssl_context(), timeout=WEBDAV_RESPONSE_TIMEOUT)
-                            else:
-                                conn = http.client.HTTPConnection(host, timeout=WEBDAV_RESPONSE_TIMEOUT)
-
-                            headers = {
-                                "Content-Type":   "application/octet-stream",
-                                "Content-Length": str(bytes_to_send),
-                            }
-                            # The streaming PUT bypasses urllib entirely, so the
-                            # opener's credentials never apply here - the header
-                            # has to be set explicitly or ERDA answers 401.
-                            headers.update(_webdav_auth_header())
-
-                            # The watchdog shuts the socket down if the machine sleeps or the
-                            # stream stalls, so the blocked send()/getresponse() raises and the
-                            # retry loop below starts a clean upload instead of hanging forever.
-                            # shutdown() wakes the blocked call on Linux; on Windows it
-                            # sometimes does not, close() does. On macOS neither wakes a
-                            # blocked send(), so the body is also sent with a socket
-                            # timeout just past `stall_after`: a stall ends there on every OS.
-                            def _abort_conn(c=conn):
-                                for stop in (lambda s: s.shutdown(socket.SHUT_RDWR),
-                                             lambda s: s.close()):
-                                    try: stop(c.sock)
-                                    except Exception: pass
-
-                            try:
-                                with SuspendWatchdog(_abort_conn) as wd:
-                                    try:
-                                        conn.connect()
-                                        conn.sock.settimeout(wd.send_timeout)
-                                        conn.putrequest("PUT", path)
-                                        for hk, hv in headers.items():
-                                            conn.putheader(hk, hv)
-                                        conn.endheaders()
-
-                                        done_bytes = resume_from
-                                        _last_ui   = 0.0
-                                        while True:
-                                            chunk = fi.read(chunk_size)
-                                            if not chunk:
-                                                break
-                                            conn.send(chunk)
-                                            wd.progress()
-                                            done_bytes += len(chunk)
-
-                                            # Throttled progress update (see UI_UPDATE_INTERVAL).
-                                            _now = time.monotonic()
-                                            if (_now - _last_ui < UI_UPDATE_INTERVAL
-                                                    and done_bytes < src_size):
-                                                continue
-                                            _last_ui = _now
-                                            elapsed_f = max(time.time() - file_t_start, 0.001)
-                                            speed_mb  = ((done_bytes - resume_from) / elapsed_f) / (1024*1024)
-                                            pct_file  = done_bytes / max(src_size, 1)
-                                            overall   = base_pct + pct_file / total
-                                            remaining = src_size - done_bytes
-                                            eta_s     = remaining / max(
-                                                (done_bytes - resume_from) / elapsed_f, 1)
-                                            label = (
-                                                f"{done_bytes/(1024*1024):.0f} / "
-                                                f"{src_size/(1024*1024):.0f} MB  •  "
-                                                f"{speed_mb:.1f} MB/s  •  "
-                                                f"ETA {timedelta(seconds=int(eta_s))}")
-                                            self._q_update_prog(overall, i + 1, total, label)
-                                            self._queue.put(('file_info',
-                                                f"[{i+1}/{total}]  {name}  ({pct_file*100:.0f}%)"))
-
-                                        # ERDA checksums the file before answering: silence is
-                                        # normal here, so only a suspend may abort the wait.
-                                        wd.armed = False
-                                        conn.sock.settimeout(WEBDAV_RESPONSE_TIMEOUT)
-                                        response = conn.getresponse()
-                                        resp_status = response.status
-                                    except Exception as e:
-                                        if wd.reason:
-                                            raise IOError(wd.reason) from e
-                                        raise
-                            finally:
-                                conn.close()
-
-                            if resp_status in (200, 201, 204):
-                                self._q_log(
-                                    f"         ✓  Uploaded  ({src_size/(1024*1024):.1f} MB)"
-                                    f"  HTTP {resp_status}", C["success"])
-                                upload_ok = True
-                                r['new_path']    = file_url
-                                r['dest_folder'] = col_url
-                                break
-                            elif resp_status == 409:
-                                raise IOError(
-                                    "HTTP 409 — the destination folder does not "
-                                    "exist on the server and could not be created. "
-                                    f"Check the destination URL and the {SECRET_LABEL}.")
-                            elif resp_status in (401, 403):
-                                raise IOError(
-                                    f"HTTP {resp_status} — authentication refused. "
-                                    f"Check the {SETTINGS['remote']['secret_label']}.")
-                            elif resp_status == 507:
-                                raise IOError(
-                                    "HTTP 507 — no space left on the server.")
-                            else:
-                                raise IOError(f"HTTP {resp_status} from server")
-
+                        job = job_q.get_nowait()
+                    except queue.Empty:
+                        return
+                    tracker.start(job)
+                    try:
+                        outcome = self._upload_one_webdav(
+                            job, tracker, dest_root, mkcol_lock)
                     except Exception as e:
-                        err_msg = str(e)
-                        # Authentication and configuration errors will not fix
-                        # themselves: retrying five times at 15 s apart burns
-                        # 75 s per file for nothing.
-                        if any(t in err_msg for t in
-                               ("401", "403", "409", "507", "authentication refused")):
-                            self._q_log(f"         ✗  {err_msg}", C["danger"])
-                            self._q_log("         (not retrying — this will not "
-                                        "resolve on its own)", C["muted"])
-                            LOG.error(f"permanent upload error for {name}: {err_msg}")
-                            r['status'] = 'error'; r['error'] = err_msg
-                            break
-                        if attempt < max_retries - 1:
-                            self._q_log(
-                                f"         ⚠  Upload error (attempt {attempt+1}/{max_retries}): "
-                                f"{err_msg}", C["warning"])
-                            self._q_log(
-                                f"         ⏳  Retrying in {retry_delay}s…", C["muted"])
-                            self._queue.put(('copy_error', (name, err_msg, attempt+1)))
-                            # Reuse the single Event created in __init__.
-                            # Rebinding it here raced with the UI thread reading
-                            # self._retry_event in _show_retry_popup: the popup
-                            # could set an Event nobody was waiting on any more.
-                            self._retry_event.clear()
-                            deadline = time.time() + retry_delay
-                            while time.time() < deadline:
-                                if self._cancel_flag.is_set():
-                                    self._queue.put(('cancelled', None))
-                                    return
-                                if self._retry_event.is_set():
-                                    break
-                                time.sleep(0.5)
-                        else:
-                            self._q_log(
-                                f"         ✗  Upload failed after {max_retries} attempts: "
-                                f"{err_msg}", C["danger"])
-                            r['status'] = 'error'
-                            r['error']  = err_msg
+                        # One file failing in an unforeseen way must not take
+                        # the other uploads down with it.
+                        LOG.exception(f"upload of {job.name} crashed", e)
+                        self._q_log(f"{job.tag}  ✗  {job.name}: unexpected error: {e}",
+                                    C["danger"])
+                        job.r['status'] = 'error'; job.r['error'] = str(e)
+                        outcome = 'error'
+                    tracker.finish(job, outcome)
 
-                # Upload companion files (.SRT, .LRF) via WebDAV PUT too
-                if upload_ok:
-                    for comp in find_companion_files(src):
-                        comp_name = os.path.basename(comp)
-                        comp_url  = col_url + urllib.parse.quote(comp_name, safe="")
-                        remote_comp_sz = _webdav_file_remote_size(comp_url, timeout=8)
-                        try:
-                            local_comp_sz = os.path.getsize(comp)
-                        except Exception:
-                            continue
-                        if remote_comp_sz == local_comp_sz:
-                            self._q_log(
-                                f"         ⏭  Companion already on server — skipped: {comp_name}",
-                                C["muted"])
-                            continue
-                        try:
-                            with open(comp, 'rb') as fc:
-                                comp_data = fc.read()
-                            _webdav_request(
-                                comp_url, "PUT", data=comp_data,
-                                headers={"Content-Type": "application/octet-stream",
-                                         "Content-Length": str(len(comp_data))},
-                                timeout=120)
-                            self._q_log(
-                                f"         ✓  Companion: {comp_name}", C["muted"])
-                        except Exception as e:
-                            self._q_log(
-                                f"         ⚠  Companion upload failed: {e}", C["warning"])
-
-                # Running total. The old expression summed the CURRENT file's
-                # size once per already-uploaded file - i.e. src_size * n, which
-                # was not the transferred volume by any reading, and cost a HEAD
-                # round trip per entry on top.
-                if upload_ok:
-                    mb_done_total += src_size / (1024 * 1024)
-                elapsed  = time.time() - t_start
-                speed    = mb_done_total / max(elapsed, 0.001)
-                avg_left = (elapsed / (i + 1)) * (total - i - 1)
-                self._q_eta(speed, str(timedelta(seconds=int(avg_left))), i + 1, total)
-                self._q_update_prog((i + 1) / total, i + 1, total, "")
+            threads = [threading.Thread(target=_runner, daemon=True,
+                                        name=f"upload-{k + 1}")
+                       for k in range(n_par if n_files else 0)]
+            for t in threads:
+                t.start()
+            while any(t.is_alive() for t in threads):
+                self._publish_upload_progress(tracker, n_par)
+                time.sleep(0.5)
+            self._publish_upload_progress(tracker, n_par)
 
             n_err = sum(1 for rr in self.renamed if rr.get('status') == 'error')
             n_ok  = sum(1 for rr in self.renamed if rr.get('new_path'))
+            if self._cancel_flag.is_set() and not tracker.all_finished():
+                self._q_log(f"\n⚠  Cancelled — {n_ok} of {n_files} file(s) uploaded.",
+                            C["warning"])
+                self._queue.put(('cancelled', None))
+                return
             if n_err:
                 self._q_log(f"\n⚠  Finished with {n_err} failure(s); "
                             f"{n_ok} file(s) uploaded.", C["warning"])
@@ -4192,6 +4160,282 @@ class App(tk.Tk):
         finally:
             _ka_stop.set()
             restore_fn()
+
+    def _publish_upload_progress(self, tracker, n_par: int):
+        """Send the overall bar, the status line and the per-file lines to the
+        UI. Called by the coordinator every half second."""
+        snap = tracker.snapshot()
+        n, total_b, acc_b = snap['n_files'], snap['total_bytes'], snap['accounted']
+        frac  = (acc_b / total_b) if total_b else (snap['n_done'] / n if n else 1.0)
+        label = f"{_fmt_bytes(acc_b)} / {_fmt_bytes(total_b)}" if total_b else ""
+        self._q_update_prog(frac, snap['n_done'], n, label)
+
+        speed = snap['speed']                     # bytes/s over the last ~20 s
+        active = snap['active']
+        if any(a['phase'] == 'retry' for a in active):
+            status, colour = "⚠  Network problem — retrying automatically…", C["warning"]
+        elif active:
+            left = total_b - acc_b
+            eta  = (str(timedelta(seconds=int(left / speed)))
+                    if speed > 1024 else "calculating…")
+            at_once = (f"{len(active)} files at a time" if len(active) > 1
+                       else "1 file at a time")
+            status = (f"Uploading {at_once}  •  {speed / (1024 * 1024):.1f} MB/s  •  "
+                      f"ETA {eta}  •  {snap['n_done']}/{n} files done")
+            colour = C["muted"]
+        else:
+            status, colour = f"{snap['n_done']}/{n} files done", C["muted"]
+        self._queue.put(('status', (status, colour)))
+
+        now   = time.monotonic()
+        lines = []
+        for a in active:
+            head = f"{a['tag']}  {a['name']}  —  "
+            if a['phase'] == 'sending':
+                pct = a['sent'] / a['size'] * 100 if a['size'] else 100
+                spd = a['sent'] / max(now - a['t_send'], 0.001) / (1024 * 1024)
+                lines.append(head + f"{pct:.0f}% of {_fmt_bytes(a['size'])}  •  "
+                                    f"{spd:.1f} MB/s")
+            elif a['phase'] == 'server':
+                lines.append(head + "sent, waiting for the server to confirm…")
+            elif a['phase'] == 'retry':
+                wait = max(0, int(a['retry_at'] - now))
+                lines.append(head + f"⚠ connection error, next try in {wait} s "
+                                    f"(attempt {a['attempt'] + 1}/{WEBDAV_MAX_RETRIES})")
+            elif a['phase'] == 'companions':
+                lines.append(head + "sending its subtitle/telemetry files…")
+            else:
+                lines.append(head + "checking the server…")
+        self._queue.put(('file_info', "\n".join(lines)))
+
+    def _upload_one_webdav(self, job, tracker, dest_root: str, mkcol_lock) -> str:
+        """
+        Upload one file and its companions. Runs in an upload thread; may run
+        alongside others. Returns 'ok', 'error' or 'cancelled'.
+        """
+        r, name, tag, src_size = job.r, job.name, job.tag, job.size
+        src = r['path']
+
+        def flog(text, colour=None):
+            self._q_log(f"{tag}  {text}", colour)
+
+        is_tr = NAMING.is_training_name(name) or bool(r.get('is_training'))
+        parts = NAMING.dest_parts(is_tr, r)
+
+        # Two uploads may need the same new folder at the same moment; the
+        # second MKCOL would fail (405) and log a needless warning.
+        try:
+            with mkcol_lock:
+                col_url = _webdav_ensure_collection(
+                    dest_root.rstrip("/"), parts, timeout=15)
+        except Exception as e:
+            flog(f"⚠  MKCOL failed: {e}", C["warning"])
+            col_url = dest_root + "".join(
+                urllib.parse.quote(p, safe="") + "/" for p in parts)
+
+        file_url = col_url + urllib.parse.quote(name, safe="")
+        flog(f"▶  {name}\n{' ' * len(tag)}     → {col_url}", C["text"])
+
+        upload_ok = False
+        for attempt in range(WEBDAV_MAX_RETRIES):
+            if self._cancel_flag.is_set():
+                return 'cancelled'
+            tracker.set_phase(job, 'checking', attempt=attempt)
+
+            remote_size = _webdav_file_remote_size(file_url, timeout=10)
+            if remote_size == src_size:
+                # Size-only match. Same name and same length is almost always
+                # the same file, but not necessarily - step 6 re-checks with a
+                # head/tail hash, which is what catches a re-recorded clip that
+                # happens to match in length.
+                flog("⏭  Already on server (same size) — skipped "
+                     "(content confirmed at step 6)", C["muted"])
+                upload_ok = True
+                r['new_path'] = file_url; r['dest_folder'] = col_url
+                break
+
+            # Many WebDAV servers (ERDA among them) do not honour Content-Range
+            # resume: a partial remote file can never be appended to. Remove it
+            # and re-upload the whole file from byte 0 instead.
+            if 0 < remote_size < src_size:
+                flog(f"🗑  Removing incomplete remote file "
+                     f"({remote_size / (1024 * 1024):.1f} MB) and re-uploading…",
+                     C["muted"])
+                ok_del, del_msg = _webdav_delete(file_url, timeout=30)
+                if not ok_del:
+                    flog(f"⚠  Could not delete partial file ({del_msg}); "
+                         "PUT will attempt to overwrite it", C["warning"])
+
+            try:
+                resp_status = self._put_file_webdav(job, tracker, file_url)
+                if resp_status in (200, 201, 204):
+                    flog(f"✓  Uploaded {name}  ({src_size / (1024 * 1024):.1f} MB)  "
+                         f"HTTP {resp_status}", C["success"])
+                    upload_ok = True
+                    r['new_path'] = file_url; r['dest_folder'] = col_url
+                    break
+                elif resp_status == 409:
+                    raise IOError(
+                        "HTTP 409 — the destination folder does not exist on "
+                        "the server and could not be created. "
+                        f"Check the destination URL and the {SECRET_LABEL}.")
+                elif resp_status in (401, 403):
+                    raise IOError(
+                        f"HTTP {resp_status} — authentication refused. "
+                        f"Check the {SETTINGS['remote']['secret_label']}.")
+                elif resp_status == 507:
+                    raise IOError("HTTP 507 — no space left on the server.")
+                else:
+                    raise IOError(f"HTTP {resp_status} from server")
+
+            except _UploadCancelled:
+                # Stopped mid-file: do not leave a truncated copy behind. The
+                # server may store what it received only once it notices the
+                # closed connection, i.e. after a first DELETE: check again.
+                for _ in range(3):
+                    _webdav_delete(file_url, timeout=30)
+                    time.sleep(1.0)
+                    if _webdav_file_remote_size(file_url, timeout=10) < 0:
+                        break
+                flog("✕  Cancelled — the partial copy was removed from the server",
+                     C["warning"])
+                return 'cancelled'
+
+            except Exception as e:
+                err_msg = str(e)
+                # Authentication and configuration errors will not fix
+                # themselves: retrying five times at 15 s apart burns 75 s per
+                # file for nothing.
+                if any(t in err_msg for t in
+                       ("401", "403", "409", "507", "authentication refused")):
+                    flog(f"✗  {err_msg}", C["danger"])
+                    flog("(not retrying — this will not resolve on its own)", C["muted"])
+                    LOG.error(f"permanent upload error for {name}: {err_msg}")
+                    r['status'] = 'error'; r['error'] = err_msg
+                    return 'error'
+                if attempt < WEBDAV_MAX_RETRIES - 1:
+                    flog(f"⚠  Upload error (attempt {attempt + 1}/{WEBDAV_MAX_RETRIES}): "
+                         f"{err_msg}", C["warning"])
+                    flog(f"⏳  Retrying in {WEBDAV_RETRY_DELAY}s…", C["muted"])
+                    self._queue.put(('copy_error', (name, err_msg, attempt + 1)))
+                    # "Force retry now" bumps _retry_gen. A counter, not an
+                    # Event: with several uploads waiting, one of them clearing
+                    # a shared Event could swallow the click meant for all.
+                    gen      = self._retry_gen
+                    deadline = time.monotonic() + WEBDAV_RETRY_DELAY
+                    tracker.set_phase(job, 'retry', attempt=attempt, retry_at=deadline)
+                    while time.monotonic() < deadline:
+                        if self._cancel_flag.is_set():
+                            return 'cancelled'
+                        if self._retry_gen != gen:
+                            break
+                        time.sleep(0.25)
+                else:
+                    flog(f"✗  Upload failed after {WEBDAV_MAX_RETRIES} attempts: "
+                         f"{err_msg}", C["danger"])
+                    r['status'] = 'error'; r['error'] = err_msg
+                    return 'error'
+
+        if not upload_ok:
+            return 'cancelled' if self._cancel_flag.is_set() else 'error'
+
+        # Companion files (.SRT, .LRF, flight-log CSV): small, one PUT each.
+        tracker.set_phase(job, 'companions')
+        for comp in find_companion_files(src):
+            comp_name = os.path.basename(comp)
+            comp_url  = col_url + urllib.parse.quote(comp_name, safe="")
+            remote_comp_sz = _webdav_file_remote_size(comp_url, timeout=8)
+            try:
+                local_comp_sz = os.path.getsize(comp)
+            except Exception:
+                continue
+            if remote_comp_sz == local_comp_sz:
+                flog(f"⏭  Companion already on server — skipped: {comp_name}",
+                     C["muted"])
+                continue
+            try:
+                with open(comp, 'rb') as fc:
+                    comp_data = fc.read()
+                _webdav_request(
+                    comp_url, "PUT", data=comp_data,
+                    headers={"Content-Type": "application/octet-stream",
+                             "Content-Length": str(len(comp_data))},
+                    timeout=120)
+                flog(f"✓  Companion: {comp_name}", C["muted"])
+            except Exception as e:
+                flog(f"⚠  Companion upload failed: {comp_name}: {e}", C["warning"])
+        return 'ok'
+
+    def _put_file_webdav(self, job, tracker, file_url: str) -> int:
+        """One streaming PUT of job's file. Returns the HTTP status; raises on a
+        network error, or _UploadCancelled when Cancel is pressed mid-file."""
+        chunk_size = 4 * 1024 * 1024
+        parsed = urllib.parse.urlparse(file_url)
+        # Response timeout of 600 s, not 60. ERDA checksums a multi-GB upload
+        # after the last byte arrives, which took far longer than a minute:
+        # getresponse() timed out on files that had in fact been stored fine.
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(
+                parsed.netloc, context=_ssl_context(), timeout=WEBDAV_RESPONSE_TIMEOUT)
+        else:
+            conn = http.client.HTTPConnection(parsed.netloc, timeout=WEBDAV_RESPONSE_TIMEOUT)
+
+        headers = {"Content-Type":   "application/octet-stream",
+                   "Content-Length": str(job.size)}
+        # The streaming PUT bypasses urllib entirely, so the opener's
+        # credentials never apply here - the header has to be set explicitly
+        # or ERDA answers 401.
+        headers.update(_webdav_auth_header())
+
+        # The watchdog shuts the socket down if the machine sleeps or the
+        # stream stalls, so the blocked send()/getresponse() raises and the
+        # retry loop starts a clean upload instead of hanging forever.
+        # shutdown() wakes the blocked call on Linux; on Windows it sometimes
+        # does not, close() does. On macOS neither wakes a blocked send(), so
+        # the body is also sent with a socket timeout just past `stall_after`:
+        # a stall ends there on every OS.
+        def _abort_conn(c=conn):
+            for stop in (lambda s: s.shutdown(socket.SHUT_RDWR),
+                         lambda s: s.close()):
+                try: stop(c.sock)
+                except Exception: pass
+
+        try:
+            with open(job.r['path'], 'rb') as fi, SuspendWatchdog(_abort_conn) as wd:
+                try:
+                    conn.connect()
+                    conn.sock.settimeout(wd.send_timeout)
+                    conn.putrequest("PUT", parsed.path)
+                    for hk, hv in headers.items():
+                        conn.putheader(hk, hv)
+                    conn.endheaders()
+
+                    tracker.set_phase(job, 'sending')
+                    while True:
+                        if self._cancel_flag.is_set():
+                            raise _UploadCancelled()
+                        chunk = fi.read(chunk_size)
+                        if not chunk:
+                            break
+                        conn.send(chunk)
+                        wd.progress()
+                        tracker.add_sent(job, len(chunk))
+
+                    # ERDA checksums the file before answering: silence is
+                    # normal here, so only a suspend may abort the wait.
+                    tracker.set_phase(job, 'server')
+                    wd.armed = False
+                    conn.sock.settimeout(WEBDAV_RESPONSE_TIMEOUT)
+                    response = conn.getresponse()
+                    return response.status
+                except _UploadCancelled:
+                    raise
+                except Exception as e:
+                    if wd.reason:
+                        raise IOError(wd.reason) from e
+                    raise
+        finally:
+            conn.close()
 
     # ── Thread-safe helpers ───────────────────────────────────────────────────
 
@@ -4289,6 +4533,10 @@ class App(tk.Tk):
             elif msg_type == 'file_info':
                 try: self._file_lbl.config(text=payload)
                 except: pass
+            elif msg_type == 'status':
+                text, colour = payload
+                try: self._eta_lbl.config(text=text, fg=colour or C["muted"])
+                except Exception: pass
             elif msg_type == 'copy_error':
                 name, err_msg, attempt = payload
                 try:
@@ -4356,9 +4604,21 @@ class App(tk.Tk):
         self.after(50, self._poll_queue)
 
     def _show_retry_popup(self, filename: str, error: str):
-        """Non-blocking popup shown on network error during copy."""
+        """Non-blocking popup shown on network error during copy.
+
+        Parallel uploads usually fail together when the network drops, so an
+        open popup is refreshed rather than stacked under a new one."""
+        try:
+            old = self._retry_popup
+            if old is not None and old.winfo_exists():
+                old._file_lbl.config(text=f"File: {filename}")
+                old._err_lbl.config(text=error)
+                return
+        except Exception:
+            pass
         try:
             popup = tk.Toplevel(self)
+            self._retry_popup = popup
             popup.title("Connection error")
             popup.configure(bg=C["bg"])
             popup.geometry("480x200")
@@ -4371,16 +4631,19 @@ class App(tk.Tk):
             tk.Label(popup, text="⚠  Network error during copy",
                      bg=C["bg"], fg=C["warning"],
                      font=('Helvetica',13,'bold')).pack(pady=(16,4))
-            tk.Label(popup, text=f"File: {filename}",
-                     bg=C["bg"], fg=C["text"],
-                     font=('Helvetica',10)).pack()
-            tk.Label(popup, text=error, bg=C["bg"], fg=C["muted"],
-                     font=('Helvetica',9), wraplength=440).pack(pady=(4,12))
+            popup._file_lbl = tk.Label(popup, text=f"File: {filename}",
+                                       bg=C["bg"], fg=C["text"],
+                                       font=('Helvetica',10))
+            popup._file_lbl.pack()
+            popup._err_lbl = tk.Label(popup, text=error, bg=C["bg"], fg=C["muted"],
+                                      font=('Helvetica',9), wraplength=440)
+            popup._err_lbl.pack(pady=(4,12))
 
             btn_row = tk.Frame(popup, bg=C["bg"]); btn_row.pack()
 
             def _force_retry():
-                self._retry_event.set()
+                self._retry_gen += 1          # wakes every waiting upload
+                self._retry_event.set()       # the folder copy still uses this
                 popup.destroy()
 
             tk.Button(btn_row, text="Force retry now",

@@ -52,6 +52,8 @@ the same places again and again can use it.
   browsers cannot play.
 - **Three ways out**: a local or USB folder, a **WebDAV** server over HTTPS, or a
   drive mounted with **SSHFS**. Each mode handles interruptions safely.
+- **Parallel uploads**: over WebDAV, 2 to 4 files can go up at the same time,
+  which uses far more of a connection than one file after the other.
 - **Verified copies**: size **and** a hash of the first and last megabyte, on the
   destination side. The "delete originals" box stays disabled until every file
   passes.

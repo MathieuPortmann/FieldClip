@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **Parallel WebDAV uploads**: several files go up at the same time (1 to 4,
+  3 by default), chosen under "Upload over HTTPS" in step 1 and remembered.
+  Over a long route one connection rarely fills the line: measured to ERDA from
+  a home connection, one upload reached ~16 Mbit/s while the line carried
+  ~105 Mbit/s across four. Step 4 shows one line per file being sent, and the
+  overall bar, speed and ETA are counted in bytes.
+- Cancel now stops an upload mid-file and removes the partial copy from the
+  server, instead of waiting for the current file to finish.
+- A network drop that hits several uploads opens one "Connection error" popup,
+  not one per file; "Force retry now" restarts all of them.
+
 ## 1.0.0 — 2026-11-02
 
 First public release. FieldClip is the generalised version of an in-house tool
